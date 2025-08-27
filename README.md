@@ -1,0 +1,2 @@
+# eenv
+Encrypted env manager
