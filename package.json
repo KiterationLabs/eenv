@@ -1,0 +1,23 @@
+{
+	"name": "eenv",
+	"version": "0.0.1",
+	"description": "Encrypted env manager",
+	"main": "index.js",
+	"bin": {
+		"findenv": "./bin/findenv.js"
+	},
+	"scripts": {
+		"dev": "node ./bin/findenv.js"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/KiterationLabs/eenv.git"
+	},
+	"keywords": [],
+	"author": "",
+	"license": "ISC",
+	"bugs": {
+		"url": "https://github.com/KiterationLabs/eenv/issues"
+	},
+	"homepage": "https://github.com/KiterationLabs/eenv#readme"
+}
