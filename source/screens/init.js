@@ -7,7 +7,7 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import {existsSync} from 'node:fs';
 import crypto from 'node:crypto';
-import Apply from './apply.js'; // ⟵ make sure this path matches your project
+import Apply from './apply.js';
 
 const CONFIG_NAME = 'eenv.config.json';
 const ENC_NAME = 'eenv.enc.json';
