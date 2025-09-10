@@ -1,7 +1,11 @@
 use clap::{Parser, Subcommand};
 use std::time::{Duration, Instant};
 use ignore::{WalkBuilder, DirEntry};
-use std::{fs, io, path::{Path, PathBuf}};
+use std::{fs, io, collections::HashMap, fs::File, path::{Path, PathBuf}};
+use std::io::BufReader;
+use std::io::BufRead;
+use std::io::Write;
+
 
 /// Small demo
 #[derive(Parser, Debug)]
@@ -52,7 +56,7 @@ fn main() -> io::Result<()> {
                 time_ok("split_env_files", move || split_env_files(files));
 
             println!("--- real env files ---");
-            for path in real {
+            for path in &real {
                 println!("{}", path.display());
             }
 
@@ -60,36 +64,26 @@ fn main() -> io::Result<()> {
             for path in examples {
                 println!("{}", path.display());
             }
-        }
-    }
 
-    Ok(())
-}
+            let skeletons = extract_env_skeletons(&real)?;
 
-/// Return absolute paths of files whose names start with ".env" in the CWD (non-recursive).
-fn find_env_files_in_cwd() -> io::Result<Vec<PathBuf>> {
-    let cwd = std::env::current_dir()?;
-    let mut out = Vec::new();
-
-    for entry in fs::read_dir(&cwd)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() {
-            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                if name.starts_with(".env") {
-                    // canonicalize to get absolute paths; fall back to original on error
-                    match path.canonicalize() {
-                        Ok(abs) => out.push(abs),
-                        Err(_) => out.push(path),
+            match ensure_env_examples_from_skeletons(&skeletons) {
+                Ok(actions) => {
+                    for (src, dst, action) in actions {
+                        let label = match action {
+                            ExampleAction::Created => "created",
+                            ExampleAction::Overwritten => "overwritten",
+                            ExampleAction::SourceIsExample => "skip",
+                        };
+                        println!("[env-example] {:<11} {}  ->  {}", label, src.display(), dst.display());
                     }
                 }
+                Err(e) => eprintln!("error creating example files: {e}"),
             }
         }
     }
 
-    out.sort();
-    out.dedup();
-    Ok(out)
+    Ok(())
 }
 
 /// Recursively find absolute paths of files whose name starts with ".env",
@@ -163,6 +157,123 @@ fn is_env_file(d: &DirEntry) -> bool {
         Some(name) if name.starts_with(".env") => true,
         _ => false,
     }
+}
+
+fn extract_env_skeletons(
+    files: &[PathBuf],
+) -> io::Result<HashMap<PathBuf, Vec<String>>> {
+    let mut out: HashMap<PathBuf, Vec<String>> = HashMap::new();
+
+    for path in files {
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+
+        let mut lines = Vec::new();
+
+        for line in reader.lines() {
+            let line = line?;
+            let trimmed = line.trim();
+
+            if trimmed.is_empty() {
+                // keep blank line
+                lines.push(String::new());
+            } else if trimmed.starts_with('#') {
+                // keep comments exactly
+                lines.push(line);
+            } else if let Some((key, _value)) = line.split_once('=') {
+                // keep key but strip value
+                lines.push(format!("{}=", key.trim()));
+            } else {
+                // line didn’t match KEY=VALUE, just preserve raw
+                lines.push(line);
+            }
+        }
+
+        out.insert(path.clone(), lines);
+    }
+
+    Ok(out)
+}
+
+fn example_path_for(path: &Path) -> PathBuf {
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+    if file_name.ends_with(".example") {
+        return path.to_path_buf();
+    }
+    let mut name = file_name.to_string();
+    name.push_str(".example");
+    path.with_file_name(name)
+}
+
+/// Write skeleton lines to a file, with a trailing newline.
+fn write_lines(path: &Path, lines: &[String]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Join with '\n' and ensure trailing newline for POSIX-friendly files
+    let mut buf = lines.join("\n");
+    if !buf.ends_with('\n') {
+        buf.push('\n');
+    }
+    fs::write(path, buf)
+}
+
+
+#[derive(Debug)]
+enum ExampleAction {
+    Created,            // file did not exist
+    Overwritten,        // file existed; we replaced it
+    SourceIsExample,    // input was already *.example
+}
+
+fn ensure_env_examples_from_skeletons(
+    skeletons: &std::collections::HashMap<PathBuf, Vec<String>>,
+) -> io::Result<Vec<(PathBuf, PathBuf, ExampleAction)>> {
+    let mut results = Vec::new();
+
+    for (real_path, lines) in skeletons {
+        let target = example_path_for(real_path);
+
+        // If the source is already an .example, skip writing.
+        if real_path == &target {
+            results.push((real_path.clone(), target, ExampleAction::SourceIsExample));
+            continue;
+        }
+
+        let existed = target.exists();
+        write_lines_atomic(&target, lines)?; // see atomic helper below
+
+        let action = if existed {
+            ExampleAction::Overwritten
+        } else {
+            ExampleAction::Created
+        };
+
+        results.push((real_path.clone(), target, action));
+    }
+
+    Ok(results)
+}
+
+fn write_lines_atomic(path: &Path, lines: &[String]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut buf = lines.join("\n");
+    if !buf.ends_with('\n') {
+        buf.push('\n');
+    }
+
+    // write to temp file in same dir
+    let tmp = path.with_extension("example.tmp~");
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(buf.as_bytes())?;
+        f.sync_all()?; // flush to disk
+    }
+    // atomic replace
+    fs::rename(tmp, path)
 }
 
 fn time_result<F, T, E>(label: &str, f: F) -> Result<(T, Duration), E>
