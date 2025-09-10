@@ -1,0 +1,6 @@
+# directories
+node_modules/
+target/
+
+# files
+*.env.local
