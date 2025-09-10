@@ -6,3 +6,9 @@ dist
 .env.production
 eenv.config.json
 
+
+
+# Added by cargo
+
+/target
+/rs/target
