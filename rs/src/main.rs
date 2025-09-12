@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use ignore::{DirEntry, WalkBuilder};
 use rand::{Rng, distr::Alphanumeric};
+use serde_json::{Value, json};
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
@@ -57,11 +58,19 @@ fn main() -> io::Result<()> {
             let repo_root = find_repo_root(&cwd)?;
 
             match ensure_eenv_config(&repo_root) {
-                Ok(true) => println!(
-                    "[init] created default eenv.config.json in {}",
-                    repo_root.display()
+                Ok(ConfigStatus::Created) => {
+                    println!("[init] created eenv.config.json in {}", repo_root.display())
+                }
+                Ok(ConfigStatus::Valid) => {
+                    println!("[init] using existing eenv.config.json (valid)")
+                }
+                Ok(ConfigStatus::FixedMissingKey) => {
+                    println!("[init] repaired eenv.config.json: inserted missing key")
+                }
+                Ok(ConfigStatus::RewrittenFromInvalid { backup }) => println!(
+                    "[init] eenv.config.json was invalid JSON -> replaced (backup: {})",
+                    backup.display()
                 ),
-                Ok(false) => println!("[init] using existing eenv.config.json"),
                 Err(e) => {
                     eprintln!("[error] could not ensure eenv.config.json: {e}");
                     std::process::exit(1);
@@ -144,26 +153,122 @@ fn generate_key() -> String {
         .collect()
 }
 
+/// Prompt user for a key (non-empty). Echoed input; swap to `rpassword` if you want hidden input.
+fn prompt_for_key() -> io::Result<String> {
+    print!("eenv: existing eenv.config.json is invalid.\nEnter key to use: ");
+    io::stdout().flush()?;
+
+    let mut s = String::new();
+    io::stdin().read_line(&mut s)?;
+    let key = s.trim().to_string();
+
+    if key.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty key not allowed",
+        ));
+    }
+    Ok(key)
+}
+
 /// Ensure eenv.config.json exists; create with random key if missing.
 /// Returns true if we had to create it.
-fn ensure_eenv_config(repo_root: &Path) -> io::Result<bool> {
-    let path = eenv_config_path(repo_root);
-
-    if path.exists() {
-        return Ok(false); // already there
+/// Write atomically: tmp -> rename
+fn write_string_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
     }
-
-    let key = generate_key();
-    let default = format!("{{\n  \"key\": \"{}\"\n}}\n", key);
-
     let tmp = path.with_extension("tmp~");
     {
         let mut f = File::create(&tmp)?;
-        f.write_all(default.as_bytes())?;
+        f.write_all(contents.as_bytes())?;
         f.sync_all()?;
     }
-    fs::rename(tmp, &path)?;
-    Ok(true)
+    fs::rename(tmp, path)
+}
+
+#[derive(Debug)]
+enum ConfigStatus {
+    Created,                                  // created new file
+    Valid,                                    // already valid, unchanged
+    FixedMissingKey,                          // added "key" to existing valid JSON
+    RewrittenFromInvalid { backup: PathBuf }, // invalid JSON -> backed up and replaced
+}
+
+/// Ensure eenv.config.json exists and is valid JSON with a "key": "<string>".
+/// - If file missing -> create with random key
+/// - If invalid JSON -> back up original (*.bak) and write fresh JSON
+/// - If valid but missing/invalid "key" -> inject a new key and rewrite (preserving other fields)
+fn ensure_eenv_config(repo_root: &Path) -> io::Result<ConfigStatus> {
+    let path = eenv_config_path(repo_root);
+
+    if !path.exists() {
+        let key = generate_key();
+        let pretty = format!("{{\n  \"key\": \"{}\"\n}}\n", key);
+        write_string_atomic(&path, &pretty)?;
+        return Ok(ConfigStatus::Created);
+    }
+
+    let text = fs::read_to_string(&path)?;
+    match serde_json::from_str::<Value>(&text) {
+        Ok(mut v) => {
+            // Ensure it's an object
+            if !v.is_object() {
+                // treat as invalid structure: rewrite from scratch, back up
+                let backup = backup_invalid_config(&path, &text)?;
+                let key = generate_key();
+                let pretty = format!("{{\n  \"key\": \"{}\"\n}}\n", key);
+                write_string_atomic(&path, &pretty)?;
+                return Ok(ConfigStatus::RewrittenFromInvalid { backup });
+            }
+
+            // Ensure "key" exists and is a non-empty string
+            let needs_key = match v.get("key") {
+                Some(Value::String(s)) => s.is_empty(),
+                _ => true,
+            };
+
+            if needs_key {
+                // Preserve other fields; just set/replace "key"
+                let key = generate_key();
+                v.as_object_mut()
+                    .expect("object checked")
+                    .insert("key".into(), Value::String(key));
+                let mut pretty = serde_json::to_string_pretty(&v).unwrap_or_else(|_| {
+                    // Fallback: minimal JSON with only key
+                    let key = generate_key();
+                    json!({ "key": key }).to_string()
+                });
+                if !pretty.ends_with('\n') {
+                    pretty.push('\n');
+                }
+                write_string_atomic(&path, &pretty)?;
+                Ok(ConfigStatus::FixedMissingKey)
+            } else {
+                Ok(ConfigStatus::Valid)
+            }
+        }
+        Err(_) => {
+            // Invalid JSON: prompt user for key, back up original, then write fresh JSON with that key
+            let key = prompt_for_key()?; // <-- user-provided
+            let backup = backup_invalid_config(&path, &text)?;
+            let pretty = format!("{{\n  \"key\": \"{}\"\n}}\n", key);
+            write_string_atomic(&path, &pretty)?;
+            Ok(ConfigStatus::RewrittenFromInvalid { backup })
+        }
+    }
+}
+
+/// Save a copy of the invalid config next to the original (timestamped .bak).
+fn backup_invalid_config(path: &Path, contents: &str) -> io::Result<PathBuf> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let backup = path.with_extension(format!("bak.{ts}"));
+    write_string_atomic(&backup, contents)?;
+    Ok(backup)
 }
 
 /// Recursively find absolute paths of files whose name starts with ".env",
