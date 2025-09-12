@@ -92,7 +92,7 @@ fn main() -> io::Result<()> {
                 Err(e) => eprintln!("error creating example files: {e}"),
             }
 
-            // after ensure_env_examples_from_skeletons(...)
+            // fix .gitignore
             match fix_gitignore_from_found(&cwd, &real) {
                 Ok(report) => {
                     if report.changed {
@@ -446,6 +446,7 @@ pub fn fix_gitignore_from_found(
     })
 }
 
+// Timing helpers
 fn time_result<F, T, E>(label: &str, f: F) -> Result<(T, Duration), E>
 where
     F: FnOnce() -> Result<T, E>,

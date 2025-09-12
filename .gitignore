@@ -1,25 +1,7 @@
 node_modules
 dist
-# Added by eenv
-.env
-.env.development
-.env.production
-eenv.config.json
-
-
 
 # Added by cargo
-
 /target
 /rs/target
 
-# === auto: env ignores ===
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-
-# === auto: env ignores (detected) ===
-rs/.env
-rs/.env.development
-rs/.env.production
