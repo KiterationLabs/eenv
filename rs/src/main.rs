@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use ignore::{DirEntry, WalkBuilder};
+use rand::{Rng, distr::Alphanumeric};
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
@@ -48,13 +49,29 @@ fn main() -> io::Result<()> {
         }
         Command::init => {
             //let files = find_env_files_in_cwd()?;
-            let cwd = std::env::current_dir()?;
+
             //let files = find_env_files_recursive(&cwd)?;
             //let (real, examples) = split_env_files(files);
 
+            let cwd = std::env::current_dir()?;
+            let repo_root = find_repo_root(&cwd)?;
+
+            match ensure_eenv_config(&repo_root) {
+                Ok(true) => println!(
+                    "[init] created default eenv.config.json in {}",
+                    repo_root.display()
+                ),
+                Ok(false) => println!("[init] using existing eenv.config.json"),
+                Err(e) => {
+                    eprintln!("[error] could not ensure eenv.config.json: {e}");
+                    std::process::exit(1);
+                }
+            }
+
             // find files (fallible)
+            // only continue if the config exists
             let (files, _t_find) = time_result("find_env_files_recursive", || {
-                find_env_files_recursive(&cwd)
+                find_env_files_recursive(&repo_root)
             })?;
 
             // split files (non-fallible) — move `files` into the closure
@@ -112,6 +129,41 @@ fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn eenv_config_path(repo_root: &Path) -> PathBuf {
+    repo_root.join("eenv.config.json")
+}
+
+/// Generate a random key (44 chars like your example)
+fn generate_key() -> String {
+    rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(44)
+        .map(char::from)
+        .collect()
+}
+
+/// Ensure eenv.config.json exists; create with random key if missing.
+/// Returns true if we had to create it.
+fn ensure_eenv_config(repo_root: &Path) -> io::Result<bool> {
+    let path = eenv_config_path(repo_root);
+
+    if path.exists() {
+        return Ok(false); // already there
+    }
+
+    let key = generate_key();
+    let default = format!("{{\n  \"key\": \"{}\"\n}}\n", key);
+
+    let tmp = path.with_extension("tmp~");
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(default.as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(tmp, &path)?;
+    Ok(true)
 }
 
 /// Recursively find absolute paths of files whose name starts with ".env",
@@ -352,7 +404,7 @@ fn to_gitignore_rel_pattern(abs: &std::path::Path, root: &std::path::Path) -> Op
 
 ///  - removes banned rules (that ignore examples/encrypted)
 ///  - adds *exactly* the discovered real `.env*` files (relative to root)
-pub fn fix_gitignore_from_found(
+fn fix_gitignore_from_found(
     project_root: &std::path::Path,
     real_env_files: &[std::path::PathBuf],
 ) -> std::io::Result<GitignoreEdit> {
@@ -410,7 +462,7 @@ pub fn fix_gitignore_from_found(
         if !lines.is_empty() && !lines.last().unwrap().trim().is_empty() {
             lines.push(String::new());
         }
-        lines.push("# === auto: env ignores (detected) ===".to_string());
+        lines.push("# added by eenv".to_string());
         for m in &missing {
             lines.push(m.clone());
         }
