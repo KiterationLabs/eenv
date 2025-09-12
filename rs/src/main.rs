@@ -1,13 +1,18 @@
 use clap::{Parser, Subcommand};
-use std::time::{Duration, Instant};
-use ignore::{WalkBuilder, DirEntry};
-use std::{fs, io, collections::HashMap, fs::File, path::{Path, PathBuf}};
-use std::io::BufReader;
+use ignore::{DirEntry, WalkBuilder};
 use std::io::BufRead;
+use std::io::BufReader;
 use std::io::Write;
+use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    fs,
+    fs::File,
+    io,
+    path::{Path, PathBuf},
+};
 
-
-/// Small demo
+// Small demo
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
@@ -26,7 +31,8 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// List .env* files in the current working directory
-    FindEnv,
+    #[allow(non_camel_case_types)]
+    init,
     /// Default greeting behavior (same as running without a subcommand)
     Greet,
 }
@@ -40,7 +46,7 @@ fn main() -> io::Result<()> {
                 println!("Hello {}!", cli.name);
             }
         }
-        Command::FindEnv => {
+        Command::init => {
             //let files = find_env_files_in_cwd()?;
             let cwd = std::env::current_dir()?;
             //let files = find_env_files_recursive(&cwd)?;
@@ -75,10 +81,32 @@ fn main() -> io::Result<()> {
                             ExampleAction::Overwritten => "overwritten",
                             ExampleAction::SourceIsExample => "skip",
                         };
-                        println!("[env-example] {:<11} {}  ->  {}", label, src.display(), dst.display());
+                        println!(
+                            "[env-example] {:<11} {}  ->  {}",
+                            label,
+                            src.display(),
+                            dst.display()
+                        );
                     }
                 }
                 Err(e) => eprintln!("error creating example files: {e}"),
+            }
+
+            // after ensure_env_examples_from_skeletons(...)
+            match fix_gitignore_from_found(&cwd, &real) {
+                Ok(report) => {
+                    if report.changed {
+                        println!(
+                            "[gitignore] updated: {}\n  + added:   {:?}\n  - removed: {:?}",
+                            report.path.display(),
+                            report.added,
+                            report.removed
+                        );
+                    } else {
+                        println!("[gitignore] no changes needed ({})", report.path.display());
+                    }
+                }
+                Err(e) => eprintln!("[gitignore] error: {e}"),
             }
         }
     }
@@ -87,20 +115,22 @@ fn main() -> io::Result<()> {
 }
 
 /// Recursively find absolute paths of files whose name starts with ".env",
-/// honoring `.gitignore`, `.ignore`, and any `.eenvignore` files.
+/// using any `.eenvignore` files.
 /// Also hard-skips `node_modules` for speed.
 fn find_env_files_recursive(root: &Path) -> io::Result<Vec<PathBuf>> {
     let mut builder = WalkBuilder::new(root);
     builder
-        .hidden(true)            // include .dot files (we want .env)
+        .hidden(true) // include .dot files (we want .env)
         .follow_links(false)
-        .standard_filters(false)   // respect .gitignore/.ignore/etc
-        .parents(false)            // also load ignore rules from parent dirs
-        .add_custom_ignore_filename(".eenvignore")  // our custom file(s)
+        .standard_filters(false) // respect .gitignore/.ignore/etc
+        .parents(false) // also load ignore rules from parent dirs
+        .add_custom_ignore_filename(".eenvignore") // our custom file(s)
         // Hard skip big dirs early (fastest):
         .filter_entry(|d| {
             // Allow root itself:
-            if d.depth() == 0 { return true; }
+            if d.depth() == 0 {
+                return true;
+            }
             true
         });
 
@@ -159,9 +189,7 @@ fn is_env_file(d: &DirEntry) -> bool {
     }
 }
 
-fn extract_env_skeletons(
-    files: &[PathBuf],
-) -> io::Result<HashMap<PathBuf, Vec<String>>> {
+fn extract_env_skeletons(files: &[PathBuf]) -> io::Result<HashMap<PathBuf, Vec<String>>> {
     let mut out: HashMap<PathBuf, Vec<String>> = HashMap::new();
 
     for path in files {
@@ -196,7 +224,10 @@ fn extract_env_skeletons(
 }
 
 fn example_path_for(path: &Path) -> PathBuf {
-    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
     if file_name.ends_with(".example") {
         return path.to_path_buf();
     }
@@ -205,25 +236,11 @@ fn example_path_for(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Write skeleton lines to a file, with a trailing newline.
-fn write_lines(path: &Path, lines: &[String]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    // Join with '\n' and ensure trailing newline for POSIX-friendly files
-    let mut buf = lines.join("\n");
-    if !buf.ends_with('\n') {
-        buf.push('\n');
-    }
-    fs::write(path, buf)
-}
-
-
 #[derive(Debug)]
 enum ExampleAction {
-    Created,            // file did not exist
-    Overwritten,        // file existed; we replaced it
-    SourceIsExample,    // input was already *.example
+    Created,         // file did not exist
+    Overwritten,     // file existed; we replaced it
+    SourceIsExample, // input was already *.example
 }
 
 fn ensure_env_examples_from_skeletons(
@@ -274,6 +291,159 @@ fn write_lines_atomic(path: &Path, lines: &[String]) -> io::Result<()> {
     }
     // atomic replace
     fs::rename(tmp, path)
+}
+
+/// Where to write the `.gitignore` (repo root). Walks up until it finds `.git`.
+fn find_repo_root(start: &Path) -> io::Result<PathBuf> {
+    let mut cur = start.canonicalize()?;
+    loop {
+        if cur.join(".git").exists() {
+            return Ok(cur);
+        }
+        let Some(parent) = cur.parent() else {
+            return Ok(start.to_path_buf());
+        };
+        cur = parent.to_path_buf();
+    }
+}
+
+/// Patterns that should NOT be ignored and must be removed if present.
+fn banned_env_ignores() -> &'static [&'static str] {
+    &[
+        // examples
+        ".env.example",
+        ".env*.example",
+        ".env.*.example",
+        "*.env.example",
+        // encrypted
+        ".env.enc",
+        ".env*.enc",
+        ".env.*.enc",
+        "*.env.enc",
+    ]
+}
+
+/// Strip trailing comments and trim.
+fn pattern_core(line: &str) -> &str {
+    let mut core = line;
+    if let Some(hash) = line.find('#') {
+        core = &line[..hash];
+    }
+    core.trim()
+}
+
+#[derive(Debug)]
+pub struct GitignoreEdit {
+    pub path: PathBuf,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub changed: bool,
+}
+
+/// Convert an absolute path to a .gitignore pattern relative to repo root,
+/// with forward slashes and spaces escaped.
+fn to_gitignore_rel_pattern(abs: &std::path::Path, root: &std::path::Path) -> Option<String> {
+    let rel = abs.strip_prefix(root).ok()?;
+    let s = rel.to_string_lossy().replace('\\', "/");
+    // Escape spaces (gitignore uses backslash escaping)
+    let s = s.replace(' ', r"\ ");
+    Some(if s.is_empty() { String::from("/") } else { s })
+}
+
+///  - removes banned rules (that ignore examples/encrypted)
+///  - adds *exactly* the discovered real `.env*` files (relative to root)
+pub fn fix_gitignore_from_found(
+    project_root: &std::path::Path,
+    real_env_files: &[std::path::PathBuf],
+) -> std::io::Result<GitignoreEdit> {
+    let root = find_repo_root(project_root)?;
+    let path = root.join(".gitignore");
+
+    let original = if path.exists() {
+        std::fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+
+    let mut lines: Vec<String> = if original.is_empty() {
+        Vec::new()
+    } else {
+        original.lines().map(|s| s.to_string()).collect()
+    };
+
+    use std::collections::{BTreeSet, HashSet};
+
+    // 1) Remove banned patterns (exact core match against common forms)
+    let banned: HashSet<&'static str> = banned_env_ignores().iter().copied().collect();
+    let mut removed = Vec::new();
+    lines.retain(|line| {
+        let core = pattern_core(line);
+        if !core.is_empty() && banned.contains(core) {
+            removed.push(line.clone());
+            false
+        } else {
+            true
+        }
+    });
+
+    // 2) Build the required set from actually found files (relative patterns)
+    let mut required: BTreeSet<String> = BTreeSet::new(); // sorted and dedup
+    for abs in real_env_files {
+        if let Some(pat) = to_gitignore_rel_pattern(abs, &root) {
+            // For root-level ".env" this yields ".env", for nested "apps/api/.env"
+            // this yields "apps/api/.env" — both correct for a root .gitignore.
+            required.insert(pat);
+        }
+    }
+
+    // Existing cores after removals
+    let existing: HashSet<String> = lines.iter().map(|l| pattern_core(l).to_string()).collect();
+
+    // 3) Append a block with missing required patterns (if any)
+    let mut added = Vec::new();
+    let missing: Vec<String> = required
+        .into_iter()
+        .filter(|r| !existing.contains(r))
+        .collect();
+
+    if !missing.is_empty() {
+        if !lines.is_empty() && !lines.last().unwrap().trim().is_empty() {
+            lines.push(String::new());
+        }
+        lines.push("# === auto: env ignores (detected) ===".to_string());
+        for m in &missing {
+            lines.push(m.clone());
+        }
+        added.extend(missing);
+    }
+
+    // 4) Write back atomically if changed
+    let new_text = {
+        let mut s = lines.join("\n");
+        if !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s
+    };
+
+    let changed = new_text != original;
+    if changed {
+        let tmp = path.with_extension("tmp~");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            use std::io::Write;
+            f.write_all(new_text.as_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(tmp, &path)?;
+    }
+
+    Ok(GitignoreEdit {
+        path,
+        added,
+        removed,
+        changed,
+    })
 }
 
 fn time_result<F, T, E>(label: &str, f: F) -> Result<(T, Duration), E>
