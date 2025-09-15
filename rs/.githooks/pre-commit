@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+
+# Run your tool in "write" mode so it updates artifacts and stages them.
+# If it exits non-zero, the commit is aborted by Git.
+"$repo_root/target/release/eenv" pre-commit --write
+
+# Optional: add further gates
+# cargo fmt -- --check
+# cargo clippy -- -D warnings

@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
+use std::process::Command as Proc;
 use std::time::{Duration, Instant};
 use std::{
     collections::HashMap,
@@ -35,70 +36,97 @@ enum Command {
     /// List .env* files in the current working directory
     #[allow(non_camel_case_types)]
     init,
+    /// Run validations for git pre-commit
+    PreCommit {
+        /// Also write/refresh artifacts (*.example, *.enc) and git add them
+        #[arg(long)]
+        write: bool,
+    },
     /// Default greeting behavior (same as running without a subcommand)
     Greet,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EenvState {
+    pub enc: bool,      // any .env*.enc files exist
+    pub example: bool,  // any .env*.example files exist
+    pub env: bool,      // any real .env* files exist
+    pub eenvjson: bool, // eenv.config.json exists AND is valid (JSON object with non-empty "key")
 }
 
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
 
     match cli.command.unwrap_or(Command::Greet) {
+        Command::PreCommit { write } => {
+            let cwd = std::env::current_dir()?;
+            let repo_root = find_repo_root(&cwd)?;
+            // Exit with non-zero on violation so Git aborts the commit
+            if let Err(e) = pre_commit(&repo_root, write) {
+                eprintln!("[pre-commit] {e}");
+                std::process::exit(1);
+            }
+        }
         Command::Greet => {
             for _ in 0..cli.count {
                 println!("Hello {}!", cli.name);
             }
         }
         Command::init => {
-            //let files = find_env_files_in_cwd()?;
-
-            //let files = find_env_files_recursive(&cwd)?;
-            //let (real, examples) = split_env_files(files);
-
             let cwd = std::env::current_dir()?;
             let repo_root = find_repo_root(&cwd)?;
 
-            match ensure_eenv_config(&repo_root) {
-                Ok(ConfigStatus::Created) => {
-                    println!("[init] created eenv.config.json in {}", repo_root.display())
-                }
-                Ok(ConfigStatus::Valid) => {
-                    println!("[init] using existing eenv.config.json (valid)")
-                }
-                Ok(ConfigStatus::FixedMissingKey) => {
-                    println!("[init] repaired eenv.config.json: inserted missing key")
-                }
-                Ok(ConfigStatus::RewrittenFromInvalid { backup }) => println!(
-                    "[init] eenv.config.json was invalid JSON -> replaced (backup: {})",
-                    backup.display()
-                ),
-                Err(e) => {
-                    eprintln!("[error] could not ensure eenv.config.json: {e}");
-                    std::process::exit(1);
-                }
+            init(&repo_root)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn init(repo_root: &Path) -> io::Result<()> {
+    // 1) Probe state (pure)
+    let state = compute_eenv_state(repo_root)?;
+    println!("[state]");
+    println!("enc = {}", state.enc);
+    println!("example = {}", state.example);
+    println!("env = {}", state.env);
+    println!("eenvjson = {}", state.eenvjson);
+
+    // 2) If encrypted envs exist, require valid eenv.config.json before proceeding
+    if state.enc {
+        if state.eenvjson {
+            // your encryption/decryption workflow goes here
+            if let Err(e) = handle_enc_workflow(repo_root) {
+                eprintln!("[enc] error: {e}");
             }
+        } else {
+            eprintln!(
+                "[enc] found .env*.enc but eenv.config.json is missing/invalid. \
+                 Run config setup first."
+            );
+        }
+    }
 
-            // find files (fallible)
-            // only continue if the config exists
-            let (files, _t_find) = time_result("find_env_files_recursive", || {
-                find_env_files_recursive(&repo_root)
-            })?;
+    // 3) If real .env files exist, optionally create examples and always fix .gitignore
+    if state.env {
+        let (files, _t_find) = time_result("find_env_files_recursive", || {
+            find_env_files_recursive(repo_root)
+        })?;
+        let ((real, examples), _t_split) =
+            time_ok("split_env_files", move || split_env_files(files));
 
-            // split files (non-fallible) — move `files` into the closure
-            let ((real, examples), _t_split) =
-                time_ok("split_env_files", move || split_env_files(files));
+        println!("--- real env files ---");
+        for path in &real {
+            println!("{}", path.display());
+        }
+        println!("--- example env files ---");
+        for path in &examples {
+            println!("{}", path.display());
+        }
 
-            println!("--- real env files ---");
-            for path in &real {
-                println!("{}", path.display());
-            }
-
-            println!("--- example env files ---");
-            for path in examples {
-                println!("{}", path.display());
-            }
-
+        // Create example files only if none exist yet
+        if !state.example {
             let skeletons = extract_env_skeletons(&real)?;
-
             match ensure_env_examples_from_skeletons(&skeletons) {
                 Ok(actions) => {
                     for (src, dst, action) in actions {
@@ -115,29 +143,80 @@ fn main() -> io::Result<()> {
                         );
                     }
                 }
-                Err(e) => eprintln!("error creating example files: {e}"),
+                Err(e) => eprintln!("[env-example] error: {e}"),
             }
+        }
 
-            // fix .gitignore
-            match fix_gitignore_from_found(&cwd, &real) {
-                Ok(report) => {
-                    if report.changed {
-                        println!(
-                            "[gitignore] updated: {}\n  + added:   {:?}\n  - removed: {:?}",
-                            report.path.display(),
-                            report.added,
-                            report.removed
-                        );
-                    } else {
-                        println!("[gitignore] no changes needed ({})", report.path.display());
-                    }
+        // Align .gitignore with discovered real env files
+        match fix_gitignore_from_found(repo_root, &real) {
+            Ok(report) => {
+                if report.changed {
+                    println!(
+                        "[gitignore] updated: {}\n  + added:   {:?}\n  - removed: {:?}",
+                        report.path.display(),
+                        report.added,
+                        report.removed
+                    );
+                } else {
+                    println!("[gitignore] no changes needed ({})", report.path.display());
                 }
-                Err(e) => eprintln!("[gitignore] error: {e}"),
             }
+            Err(e) => eprintln!("[gitignore] error: {e}"),
         }
     }
 
     Ok(())
+}
+
+/// tmp fill in later (decrypt, verify, etc.)
+fn handle_enc_workflow(_repo_root: &Path) -> io::Result<()> {
+    // TODO: implement decryption / key usage flow
+    // e.g., read eenv.config.json, derive key, decrypt .env*.enc -> .env*
+    println!("[enc] running encrypted env workflow (TODO)");
+    Ok(())
+}
+
+/// Parse + validate eenv.config.json without mutating it.
+/// Valid = file exists, is JSON object, and has non-empty "key": string
+fn validate_eenv_config(repo_root: &Path) -> io::Result<bool> {
+    let path = eenv_config_path(repo_root);
+    if !path.exists() {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(&path)?;
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) if v.is_object() => {
+            let ok = matches!(v.get("key"), Some(serde_json::Value::String(s)) if !s.is_empty());
+            Ok(ok)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Inspect the repository and return the four booleans without changing anything.
+fn compute_eenv_state(repo_root: &Path) -> io::Result<EenvState> {
+    // Re-use your scanner
+    let files = find_env_files_recursive(repo_root)?;
+    let (real, examples) = split_env_files(files);
+
+    // enc = any file name ends with .enc (for both real and example, but typical is real)
+    let enc = real.iter().chain(examples.iter()).any(|p| {
+        p.file_name()
+            .and_then(|s| s.to_str())
+            .map(|name| name.ends_with(".enc"))
+            .unwrap_or(false)
+    });
+
+    let example = !examples.is_empty();
+    let env = !real.is_empty();
+    let eenvjson = validate_eenv_config(repo_root)?;
+
+    Ok(EenvState {
+        enc,
+        example,
+        env,
+        eenvjson,
+    })
 }
 
 fn eenv_config_path(repo_root: &Path) -> PathBuf {
@@ -601,6 +680,130 @@ fn fix_gitignore_from_found(
         removed,
         changed,
     })
+}
+
+fn pre_commit(repo_root: &Path, write: bool) -> io::Result<()> {
+    // A) block plain .env* files being committed (except .example / .enc)
+    let staged = staged_files(repo_root)?;
+    let mut offenders: Vec<PathBuf> = Vec::new();
+    for p in &staged {
+        if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+            if name.starts_with(".env") && !name.ends_with(".example") && !name.ends_with(".enc") {
+                offenders.push(p.clone());
+            }
+        }
+    }
+    if !offenders.is_empty() {
+        eprintln!("[pre-commit] ❌ refusing to commit raw .env files:");
+        for p in offenders {
+            eprintln!("  - {}", p.display());
+        }
+        eprintln!("Hint: encrypt them to .env*.enc or add them to .gitignore.");
+        return Err(io::Error::new(io::ErrorKind::Other, "raw .env staged"));
+    }
+
+    // B) discover env files
+    let (files, _t_find) = time_result("find_env_files_recursive", || {
+        find_env_files_recursive(repo_root)
+    })?;
+    let ((real, examples), _t_split) = time_ok("split_env_files", || split_env_files(files));
+
+    // C) ensure .env.example exist (optional write mode)
+    if write && !real.is_empty() {
+        let skeletons = extract_env_skeletons(&real)?;
+        match ensure_env_examples_from_skeletons(&skeletons) {
+            Ok(actions) => {
+                let mut to_add: Vec<PathBuf> = Vec::new();
+                for (_src, dst, action) in actions {
+                    match action {
+                        ExampleAction::Created | ExampleAction::Overwritten => to_add.push(dst),
+                        ExampleAction::SourceIsExample => {}
+                    }
+                }
+                if !to_add.is_empty() {
+                    git_add(repo_root, &to_add)?;
+                }
+            }
+            Err(e) => eprintln!("[pre-commit] example gen error: {e}"),
+        }
+    }
+
+    // D) align .gitignore with found real env files (optional write mode)
+    if write && !real.is_empty() {
+        match fix_gitignore_from_found(repo_root, &real) {
+            Ok(report) => {
+                if report.changed {
+                    git_add(repo_root, &[report.path])?;
+                }
+            }
+            Err(e) => eprintln!("[pre-commit] gitignore fix error: {e}"),
+        }
+    }
+
+    // E) (optional) refresh encrypted files and stage them
+    // requires a valid eenv.config.json
+    if write && !real.is_empty() {
+        let cfg_ok = validate_eenv_config(repo_root)?;
+        if !cfg_ok {
+            eprintln!("[pre-commit] skipping encryption: eenv.config.json missing/invalid");
+        } else {
+            let produced = encrypt_envs_to_enc(repo_root, &real)?;
+            if !produced.is_empty() {
+                git_add(repo_root, &produced)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Get staged file paths (relative to repo root)
+fn staged_files(repo_root: &Path) -> io::Result<Vec<PathBuf>> {
+    let out = Proc::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("diff")
+        .arg("--name-only")
+        .arg("--cached")
+        .arg("-z")
+        .output()?;
+    if !out.status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other, "git diff failed"));
+    }
+    let mut files = Vec::new();
+    for name in out.stdout.split(|b| *b == 0u8) {
+        if name.is_empty() {
+            continue;
+        }
+        let s = String::from_utf8_lossy(name);
+        files.push(repo_root.join(s.as_ref()));
+    }
+    Ok(files)
+}
+
+fn git_add(repo_root: &Path, paths: &[PathBuf]) -> io::Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut cmd = Proc::new("git");
+    cmd.arg("-C").arg(repo_root).arg("add").arg("--");
+    for p in paths {
+        cmd.arg(p);
+    }
+    let status = cmd.status()?;
+    if !status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other, "git add failed"));
+    }
+    Ok(())
+}
+
+/// Stub: produce `.env*.enc` from `real` envs using decryption key.
+/// Return the list of generated/updated paths so the hook can `git add` them.
+fn encrypt_envs_to_enc(_repo_root: &Path, real_envs: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
+    // TODO: read eenv.config.json, fetch key, perform encryption
+    // temp, pretend we wrote none:
+    println!("[enc] (stub) would encrypt {} file(s)", real_envs.len());
+    Ok(Vec::new())
 }
 
 // Timing helpers
