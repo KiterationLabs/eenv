@@ -3,9 +3,3 @@ dist
 
 # Added by cargo
 /target
-
-# added by eenv
-.env
-.env.development
-.env.production
-eenv.config.json
