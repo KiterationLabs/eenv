@@ -1,7 +1,15 @@
 [package]
 name = "eenv"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
+description = "Encrypted Env Manager: encrypts .env files, manages examples, and enforces safety via git hooks."
+repository = "https://github.com/KiterationLabs/eenv"
+homepage = "https://github.com/KiterationLabs/eenv"
+documentation = "https://docs.rs/eenv"
+readme = "README.md"
+keywords = ["git", "hook", "env", "security", "crypto"]
+categories = ["command-line-utilities", "cryptography", "development-tools"]
+exclude = [".githooks/*", ".env*", "eenv.config.json"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

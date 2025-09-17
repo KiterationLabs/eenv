@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use ignore::{DirEntry, WalkBuilder};
 use rand::{distr::Alphanumeric, Rng};
 use serde_json::{json, Value};
@@ -21,6 +21,118 @@ use chacha20poly1305::{
 };
 
 const MAGIC: &[u8; 5] = b"EENV1"; // magic + version
+const HOOK_MARKER: &str = "# managed-by-eenv";
+
+fn git_hooks_dir(repo_root: &Path) -> io::Result<PathBuf> {
+    let out = Proc::new("git")
+        .arg("-C").arg(repo_root)
+        .arg("rev-parse")
+        .arg("--git-path").arg("hooks")
+        .output()?;
+    if !out.status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other, "git rev-parse failed"));
+    }
+    let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok(PathBuf::from(p))
+}
+
+fn install_git_hook(repo_root: &Path, force: bool) -> io::Result<()> {
+    // ensure it's a repo
+    let status = Proc::new("git").arg("-C").arg(repo_root).arg("rev-parse").arg("--git-dir").status()?;
+    if !status.success() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "not a git repo"));
+    }
+
+    let hooks_dir = git_hooks_dir(repo_root)?;
+    fs::create_dir_all(&hooks_dir)?;
+    let sh_path = hooks_dir.join("pre-commit");
+    let ps1_path = hooks_dir.join("pre-commit.ps1");
+
+    // Absolute path to *this* binary
+    let exe = std::env::current_exe()?;
+    let exe_str = exe.to_string_lossy();
+
+    // Generate scripts with absolute path + marker
+    let sh_content = format!(r#"#!/usr/bin/env bash
+{marker}
+set -euo pipefail
+exec "{exe}" pre-commit --write
+"#, marker = HOOK_MARKER, exe = exe_str);
+
+    let ps1_content = format!(r#"{marker}
+$ErrorActionPreference = "Stop"
+& "{exe}" pre-commit --write
+exit $LASTEXITCODE
+"#, 
+marker = HOOK_MARKER, exe = exe_str);
+
+    // Helper that writes/updates iff (a) missing, (b) ours already, or (c) force
+    fn maybe_write(path: &Path, desired: &str, force: bool) -> io::Result<bool> {
+        match fs::read_to_string(path) {
+            Ok(existing) => {
+                let ours = existing.contains(HOOK_MARKER);
+                if !ours && !force {
+                    // Respect a custom hook
+                    return Ok(false);
+                }
+                if existing == desired {
+                    // Already up to date
+                    return Ok(false);
+                }
+                // Optionally back up foreign hook if forcing
+                if !ours && force {
+                    let bak = backup_path(path);
+                    fs::copy(path, &bak).ok();
+                }
+            }
+            Err(_) => { /* will write new */ }
+        }
+        write_string_atomic(path, desired)?;
+        Ok(true)
+    }
+
+    let _sh_changed = maybe_write(&sh_path, &sh_content, force)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if sh_path.exists() {
+            let mut perm = fs::metadata(&sh_path)?.permissions();
+            perm.set_mode(0o755);
+            fs::set_permissions(&sh_path, perm)?;
+        }
+    }
+
+    let _ps1_changed = maybe_write(&ps1_path, &ps1_content, force)?;
+    Ok(())
+}
+
+fn backup_path(p: &Path) -> PathBuf {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    p.with_extension(format!("bak.{ts}"))
+}
+
+fn uninstall_git_hook(repo_root: &Path, force: bool) -> io::Result<()> {
+    // respect core.hooksPath (same as install)
+    let hooks_dir = git_hooks_dir(repo_root)?;
+    for name in ["pre-commit", "pre-commit.ps1"] {
+        let p = hooks_dir.join(name);
+        if !p.exists() { continue; }
+        if force {
+            let _ = fs::remove_file(&p);
+            continue;
+        }
+        if let Ok(existing) = fs::read_to_string(&p) {
+            if existing.contains(HOOK_MARKER) {
+                let _ = fs::remove_file(&p);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum HookAction { Install, Uninstall }
 
 // Small demo
 #[derive(Parser, Debug)]
@@ -36,11 +148,12 @@ struct Cli {
     /// Number of times to greet (used by `greet`)
     #[arg(short, long, default_value_t = 1)]
     count: u8,
+    
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// List .env* files in the current working directory
+    // Prefer PascalCase for variants; clap still works either way
     #[allow(non_camel_case_types)]
     init,
     /// Run validations for git pre-commit
@@ -49,7 +162,14 @@ enum Command {
         #[arg(long)]
         write: bool,
     },
-    /// Default greeting behavior (same as running without a subcommand)
+    /// Manage the pre-commit hook
+    Hook {
+        #[arg(value_enum)]
+        action: HookAction,
+        /// Overwrite an existing non-eenv hook
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
     Greet,
 }
 
@@ -65,25 +185,52 @@ fn main() -> io::Result<()> {
     let cli = Cli::parse();
 
     match cli.command.unwrap_or(Command::Greet) {
+        Command::init => {
+            let cwd = std::env::current_dir()?;
+            let repo_root = find_repo_root(&cwd)?;
+            if let Err(e) = install_git_hook(&repo_root, /*force=*/ false) {
+                eprintln!("[hook] WARN: could not install pre-commit hook: {e}");
+            }
+            init(&repo_root)?;
+        }
+
         Command::PreCommit { write } => {
             let cwd = std::env::current_dir()?;
             let repo_root = find_repo_root(&cwd)?;
-            // Exit with non-zero on violation so Git aborts the commit
+            if let Err(e) = install_git_hook(&repo_root, /*force=*/ false) {
+                eprintln!("[hook] WARN: could not ensure pre-commit hook: {e}");
+            }
             if let Err(e) = pre_commit(&repo_root, write) {
                 eprintln!("[pre-commit] {e}");
-                std::process::exit(1);
+                std::process::exit(1); // propagate to git
             }
         }
+
+        Command::Hook { action, force } => {
+            let cwd = std::env::current_dir()?;
+            let repo_root = find_repo_root(&cwd)?;
+            match action {
+                HookAction::Install => {
+                    if let Err(e) = install_git_hook(&repo_root, force) {
+                        eprintln!("[hook] ERROR: {e}");
+                        std::process::exit(1);
+                    }
+                    println!("[hook] installed (force={force})");
+                }
+                HookAction::Uninstall => {
+                    if let Err(e) = uninstall_git_hook(&repo_root, force) {
+                        eprintln!("[hook] ERROR: {e}");
+                        std::process::exit(1);
+                    }
+                    println!("[hook] uninstalled");
+                }
+            }
+        }
+
         Command::Greet => {
             for _ in 0..cli.count {
                 println!("Hello {}!", cli.name);
             }
-        }
-        Command::init => {
-            let cwd = std::env::current_dir()?;
-            let repo_root = find_repo_root(&cwd)?;
-
-            init(&repo_root)?;
         }
     }
 
