@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-# managed-by-eenv
-set -euo pipefail
-exec "/Users/archways404/Developer/eenv/target/release/eenv" pre-commit --write
