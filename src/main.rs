@@ -14,6 +14,13 @@ use std::{
     io,
     path::{Path, PathBuf},
 };
+use blake3;
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    XChaCha20Poly1305, XNonce,
+};
+
+const MAGIC: &[u8; 5] = b"EENV1"; // magic + version
 
 // Small demo
 #[derive(Parser, Debug)]
@@ -84,7 +91,6 @@ fn main() -> io::Result<()> {
 }
 
 fn init(repo_root: &Path) -> io::Result<()> {
-    // 1) Probe state (pure)
     let state = compute_eenv_state(repo_root)?;
     println!("[state]");
     println!("enc      = {}", state.enc);
@@ -93,88 +99,145 @@ fn init(repo_root: &Path) -> io::Result<()> {
     println!("eenvjson = {}", state.eenvjson);
     println!("-----------------");
 
-    // 2) If encrypted envs exist, require valid eenv.config.json before proceeding
+   // decrypt if .enc exist (requires valid config)
     if state.enc {
         if state.eenvjson {
-            // your encryption/decryption workflow goes here
             if let Err(e) = handle_enc_workflow(repo_root) {
                 eprintln!("[enc] error: {e}");
             }
         } else {
-            eprintln!(
-                "[enc] found .env*.enc but eenv.config.json is missing/invalid. \
-                 Run config setup first."
-            );
+            // bootstrap key flow
+            match bootstrap_key_and_decrypt(repo_root) {
+                Ok(()) => eprintln!("[enc] key accepted, config created, decrypted where possible."),
+                Err(e) => {
+                    eprintln!("[enc] could not bootstrap from key: {e}");
+                    return Err(e);
+                }
+            }
         }
     }
 
-    // 3) If real .env files exist, optionally create examples and always fix .gitignore
+    // examples, .gitignore, and encrypt (only for real plaintext files)
     if state.env {
-        let (files, _t_find) = time_result("find_env_files_recursive", || {
-            find_env_files_recursive(repo_root)
-        })?;
-        let ((real, examples), _t_split) =
-            time_ok("split_env_files", move || split_env_files(files));
+        let (files, _t_find) = time_result("find_env_files_recursive", || find_env_files_recursive(repo_root))?;
+        let ((real, examples, encs), _t_split) = time_ok("split_env_files", move || split_env_files(files));
 
-        println!("--- real env files ---");
-        for path in &real {
-            println!("{}", path.display());
-        }
-        println!("--- example env files ---");
-        for path in &examples {
-            println!("{}", path.display());
-        }
+        println!("--- real env files ---");     for p in &real { println!("{}", p.display()); }
+        println!("--- example env files ---");  for p in &examples { println!("{}", p.display()); }
+        println!("--- encrypted env files ---");for p in &encs { println!("{}", p.display()); }
 
-        // Create example files only if none exist yet
-        if !state.example {
+        if !state.example && !real.is_empty() {
             let skeletons = extract_env_skeletons(&real)?;
-            match ensure_env_examples_from_skeletons(&skeletons) {
-                Ok(actions) => {
-                    for (src, dst, action) in actions {
-                        let label = match action {
-                            ExampleAction::Created => "created",
-                            ExampleAction::Overwritten => "overwritten",
-                            ExampleAction::SourceIsExample => "skip",
-                        };
-                        println!(
-                            "[env-example] {:<11} {}  ->  {}",
-                            label,
-                            src.display(),
-                            dst.display()
-                        );
-                    }
+            if let Ok(actions) = ensure_env_examples_from_skeletons(&skeletons) {
+                for (src, dst, action) in actions {
+                    let label = match action {
+                        ExampleAction::Created => "created",
+                        ExampleAction::Overwritten => "overwritten",
+                        ExampleAction::SourceIsExample => "skip",
+                    };
+                    println!("[env-example] {:<11} {}  ->  {}", label, src.display(), dst.display());
                 }
-                Err(e) => eprintln!("[env-example] error: {e}"),
             }
         }
 
-        // Align .gitignore with discovered real env files
         match fix_gitignore_from_found(repo_root, &real) {
             Ok(report) => {
                 if report.changed {
-                    println!(
-                        "[gitignore] updated: {}\n  + added:   {:?}\n  - removed: {:?}",
-                        report.path.display(),
-                        report.added,
-                        report.removed
-                    );
+                    println!("[gitignore] updated: {}\n  + added:   {:?}\n  - removed: {:?}", report.path.display(), report.added, report.removed);
                 } else {
                     println!("[gitignore] no changes needed ({})", report.path.display());
                 }
             }
             Err(e) => eprintln!("[gitignore] error: {e}"),
         }
+
+        match ensure_eenv_config(repo_root) {
+            Ok(ConfigStatus::Created) => eprintln!("[config] created eenv.config.json"),
+            Ok(ConfigStatus::FixedMissingKey) => eprintln!("[config] injected key into eenv.config.json"),
+            Ok(ConfigStatus::RewrittenFromInvalid { backup }) => eprintln!("[config] repaired eenv.config.json (backup: {})", backup.display()),
+            Ok(ConfigStatus::Valid) => {}
+            Err(e) => eprintln!("[config] error: {e}"),
+        }
+
+        let produced = encrypt_envs_to_enc(repo_root, &real)?;
+        for p in &produced {
+            println!("[init] encrypted -> {}", p.display());
+        }
     }
 
     Ok(())
 }
 
-/// tmp fill in later (decrypt, verify, etc.)
-fn handle_enc_workflow(_repo_root: &Path) -> io::Result<()> {
-    // TODO: implement decryption / key usage flow
-    // e.g., read eenv.config.json, derive key, decrypt .env*.enc -> .env*
-    println!("[enc] running encrypted env workflow (TODO)");
+fn handle_enc_workflow(repo_root: &Path) -> io::Result<()> {
+    let key = read_eenv_key(repo_root)?;
+    let aead = XChaCha20Poly1305::new((&key).into());
+
+    let files = find_env_files_recursive(repo_root)?;
+    let (_real, _examples, encs) = split_env_files(files);
+
+    for enc_path in encs {
+        let dst = dec_output_path(&enc_path);
+
+        // Don’t clobber an existing plaintext by default.
+        if dst.exists() {
+            eprintln!("[enc] skip decrypt (target exists): {}", dst.display());
+            continue;
+        }
+
+        match decrypt_file_from_enc(&aead, &enc_path, &dst) {
+            Ok(()) => println!("[enc] decrypted {} -> {}", enc_path.display(), dst.display()),
+            Err(e) => eprintln!("[enc] WARN: could not decrypt {} ({})", enc_path.display(), e),
+        }
+    }
     Ok(())
+}
+
+fn enc_output_path(input: &Path) -> PathBuf {
+    // ".env" -> ".env.enc", ".env.local" -> ".env.local.enc"
+    let mut name = input.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+    name.push_str(".enc");
+    input.with_file_name(name)
+}
+
+fn dec_output_path(input_enc: &Path) -> PathBuf {
+    // strip trailing ".enc"
+    let name = input_enc.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if let Some(stripped) = name.strip_suffix(".enc") {
+        input_enc.with_file_name(stripped)
+    } else {
+        input_enc.with_file_name(name) // fallback
+    }
+}
+
+fn encrypt_file_to_enc(aead: &XChaCha20Poly1305, src: &Path, dst: &Path) -> io::Result<()> {
+    let plaintext = fs::read(src)?;
+    let nonce_bytes: [u8; 24] = rand::rng().random();
+    let nonce = XNonce::from_slice(&nonce_bytes);
+    let mut out = Vec::with_capacity(MAGIC.len() + nonce_bytes.len() + plaintext.len() + 32);
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&nonce_bytes);
+    let ciphertext = aead
+        .encrypt(nonce, plaintext.as_ref())
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "encrypt failed"))?;
+    out.extend_from_slice(&ciphertext);
+    write_bytes_atomic(dst, &out)
+}
+
+fn decrypt_file_from_enc(aead: &XChaCha20Poly1305, src_enc: &Path, dst: &Path) -> io::Result<()> {
+    let data = fs::read(src_enc)?;
+    if data.len() < MAGIC.len() + 24 + 16 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "enc file too short"));
+    }
+    if &data[..MAGIC.len()] != MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic/version"));
+    }
+    let nonce_bytes = &data[MAGIC.len()..MAGIC.len() + 24];
+    let nonce = XNonce::from_slice(nonce_bytes);
+    let ciphertext = &data[MAGIC.len() + 24..];
+    let plaintext = aead
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decrypt failed (wrong key?)"))?;
+    write_bytes_atomic(dst, &plaintext)
 }
 
 /// Parse + validate eenv.config.json without mutating it.
@@ -196,28 +259,15 @@ fn validate_eenv_config(repo_root: &Path) -> io::Result<bool> {
 
 /// Inspect the repository and return the four booleans without changing anything.
 fn compute_eenv_state(repo_root: &Path) -> io::Result<EenvState> {
-    // Re-use your scanner
     let files = find_env_files_recursive(repo_root)?;
-    let (real, examples) = split_env_files(files);
+    let (real, examples, encs) = split_env_files(files);
 
-    // enc = any file name ends with .enc (for both real and example, but typical is real)
-    let enc = real.iter().chain(examples.iter()).any(|p| {
-        p.file_name()
-            .and_then(|s| s.to_str())
-            .map(|name| name.ends_with(".enc"))
-            .unwrap_or(false)
-    });
-
+    let enc = !encs.is_empty();
     let example = !examples.is_empty();
     let env = !real.is_empty();
     let eenvjson = validate_eenv_config(repo_root)?;
 
-    Ok(EenvState {
-        enc,
-        example,
-        env,
-        eenvjson,
-    })
+    Ok(EenvState { enc, example, env, eenvjson })
 }
 
 fn eenv_config_path(repo_root: &Path) -> PathBuf {
@@ -394,26 +444,28 @@ fn find_env_files_recursive(root: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Split into (real_envs, example_envs)
-fn split_env_files(mut files: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    // Sort and dedup first
+/// Split into (real_plain, example_envs, encrypted_envs)
+fn split_env_files(mut files: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
     files.sort();
     files.dedup();
 
     let mut real = Vec::new();
     let mut examples = Vec::new();
+    let mut encs = Vec::new();
 
     for path in files {
         if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
             if name.ends_with(".example") {
                 examples.push(path);
+            } else if name.ends_with(".enc") {
+                encs.push(path);
             } else {
                 real.push(path);
             }
         }
     }
 
-    (real, examples)
+    (real, examples, encs)
 }
 
 fn is_env_file(d: &DirEntry) -> bool {
@@ -626,12 +678,16 @@ fn fix_gitignore_from_found(
     // 2) Build the required set from actually found files (relative patterns)
     let mut required: BTreeSet<String> = BTreeSet::new(); // sorted and dedup
     for abs in real_env_files {
+        let Some(fname) = abs.file_name().and_then(|s| s.to_str()) else { continue; };
+        if fname.ends_with(".example") || fname.ends_with(".enc") {
+            continue; // <- don't ignore examples or encrypted artifacts
+        }
         if let Some(pat) = to_gitignore_rel_pattern(abs, &root) {
-            // For root-level ".env" this yields ".env", for nested "apps/api/.env"
-            // this yields "apps/api/.env" — both correct for a root .gitignore.
             required.insert(pat);
         }
     }
+
+    required.insert("eenv.config.json".to_string());
 
     // Existing cores after removals
     let existing: HashSet<String> = lines.iter().map(|l| pattern_core(l).to_string()).collect();
@@ -707,7 +763,7 @@ fn pre_commit(repo_root: &Path, write: bool) -> io::Result<()> {
     let (files, _t_find) = time_result("find_env_files_recursive", || {
         find_env_files_recursive(repo_root)
     })?;
-    let ((real, examples), _t_split) = time_ok("split_env_files", || split_env_files(files));
+    let ((real, examples, encs), _t_split) = time_ok("split_env_files", || split_env_files(files));
 
     // C) ensure .env.example exist (optional write mode)
     if write && !real.is_empty() {
@@ -741,21 +797,131 @@ fn pre_commit(repo_root: &Path, write: bool) -> io::Result<()> {
         }
     }
 
-    // E) (optional) refresh encrypted files and stage them
-    // requires a valid eenv.config.json
+    // E) refresh encrypted files and stage them
     if write && !real.is_empty() {
-        let cfg_ok = validate_eenv_config(repo_root)?;
-        if !cfg_ok {
-            eprintln!("[pre-commit] skipping encryption: eenv.config.json missing/invalid");
-        } else {
-            let produced = encrypt_envs_to_enc(repo_root, &real)?;
-            if !produced.is_empty() {
-                git_add(repo_root, &produced)?;
-            }
+        // create/fix the config if needed
+        match ensure_eenv_config(repo_root) {
+            Ok(ConfigStatus::Created) => eprintln!("[config] created eenv.config.json"),
+            Ok(ConfigStatus::FixedMissingKey) => eprintln!("[config] injected key into eenv.config.json"),
+            Ok(ConfigStatus::RewrittenFromInvalid { backup }) => eprintln!("[config] repaired eenv.config.json (backup: {})", backup.display()),
+            Ok(ConfigStatus::Valid) => {}
+            Err(e) => eprintln!("[config] error: {e}"),
+        }
+
+        // now encrypt
+        let produced = encrypt_envs_to_enc(repo_root, &real)?;
+        if !produced.is_empty() {
+            git_add(repo_root, &produced)?;
         }
     }
 
     Ok(())
+}
+
+fn aead_from_key_str(key_str: &str) -> io::Result<XChaCha20Poly1305> {
+    if key_str.trim().is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty key"));
+    }
+    let hash = blake3::hash(key_str.as_bytes());
+    Ok(XChaCha20Poly1305::new(hash.as_bytes().into()))
+}
+
+fn write_eenv_config_with_key(repo_root: &Path, key_str: &str) -> io::Result<()> {
+    let path = eenv_config_path(repo_root);
+    let pretty = format!("{{\n  \"key\": \"{}\"\n}}\n", key_str);
+    write_string_atomic(&path, &pretty)
+}
+
+/// Ensure `.gitignore` contains `eenv.config.json` even if there are no real .env files yet.
+fn ensure_gitignore_has_config(repo_root: &Path) -> io::Result<()> {
+    let root = find_repo_root(repo_root)?;
+    let path = root.join(".gitignore");
+
+    let original = if path.exists() { fs::read_to_string(&path)? } else { String::new() };
+    let mut lines: Vec<String> = if original.is_empty() { Vec::new() } else { original.lines().map(|s| s.to_string()).collect() };
+
+    let already = lines.iter().any(|l| {
+        let core = pattern_core(l);
+        core == "eenv.config.json"
+    });
+
+    if !already {
+        if !lines.is_empty() && !lines.last().unwrap().trim().is_empty() {
+            lines.push(String::new());
+        }
+        lines.push("# added by eenv".to_string());
+        lines.push("eenv.config.json".to_string());
+
+        let mut s = lines.join("\n");
+        if !s.ends_with('\n') { s.push('\n'); }
+
+        let tmp = path.with_extension("tmp~");
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(s.as_bytes())?;
+            f.sync_all()?;
+        }
+        fs::rename(tmp, &path)?;
+    }
+    Ok(())
+}
+
+fn bootstrap_key_and_decrypt(repo_root: &Path) -> io::Result<()> {
+    // 1) Ask user for key
+    let key_str = prompt_for_key()?;
+    let aead = aead_from_key_str(&key_str)?;
+
+    // 2) Find encrypted candidates
+    let files = find_env_files_recursive(repo_root)?;
+    let (_real, _examples, encs) = split_env_files(files);
+    if encs.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "no .env*.enc files found"));
+    }
+
+    // 3) Validate the key by attempting to decrypt at least one file
+    //    We won’t clobber a plaintext that already exists; if it exists,
+    //    we decrypt to a temp to validate, then discard the temp.
+    let mut validated = false;
+    for enc_path in &encs {
+        let dst = dec_output_path(enc_path);
+        if dst.exists() {
+            // decrypt to temp just to validate
+            let tmp = dst.with_extension("validate.tmp~");
+            match decrypt_file_from_enc(&aead, enc_path, &tmp) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&tmp);
+                    validated = true;
+                    break;
+                }
+                Err(_) => {
+                    let _ = fs::remove_file(&tmp);
+                    continue;
+                }
+            }
+        } else {
+            if decrypt_file_from_enc(&aead, enc_path, &dst).is_ok() {
+                // we wrote one successfully; treat as validated.
+                // (If you prefer not to write anything until config is saved, you could write to tmp and rename after persist.)
+                validated = true;
+                break;
+            } else {
+                // cleanup if partial file created
+                let _ = fs::remove_file(&dst);
+            }
+        }
+    }
+
+    if !validated {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "provided key did not decrypt any .env*.enc"));
+    }
+
+    // 4) Persist config with this key & ensure .gitignore includes it
+    write_eenv_config_with_key(repo_root, &key_str)?;
+    ensure_gitignore_has_config(repo_root)?;
+
+    // 5) With config persisted, decrypt all remaining (non-clobbering)
+    //    Reuse your normal decrypt workflow; it already skips if target exists.
+    handle_enc_workflow(repo_root)
 }
 
 /// Get staged file paths (relative to repo root)
@@ -800,11 +966,54 @@ fn git_add(repo_root: &Path, paths: &[PathBuf]) -> io::Result<()> {
 
 /// Stub: produce `.env*.enc` from `real` envs using decryption key.
 /// Return the list of generated/updated paths so the hook can `git add` them.
-fn encrypt_envs_to_enc(_repo_root: &Path, real_envs: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
-    // TODO: read eenv.config.json, fetch key, perform encryption
-    // temp, pretend we wrote none:
-    println!("[enc] (stub) would encrypt {} file(s)", real_envs.len());
-    Ok(Vec::new())
+fn encrypt_envs_to_enc(repo_root: &Path, real_envs: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
+    let key = read_eenv_key(repo_root)?;
+    let aead = XChaCha20Poly1305::new((&key).into());
+
+    let mut produced = Vec::new();
+    for src in real_envs {
+        let Some(name) = src.file_name().and_then(|s| s.to_str()) else { continue; };
+        // Only encrypt real envs (not examples, not already .enc)
+        if name.ends_with(".example") || name.ends_with(".enc") {
+            continue;
+        }
+        let dst = enc_output_path(src);
+        encrypt_file_to_enc(&aead, src, &dst)?;
+        println!("[enc] wrote {}", dst.display());
+        produced.push(dst);
+    }
+    Ok(produced)
+}
+
+fn read_eenv_key(repo_root: &Path) -> io::Result<[u8; 32]> {
+    let cfg_path = eenv_config_path(repo_root);
+    let text = fs::read_to_string(&cfg_path)?;
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad eenv.config.json: {e}")))?;
+    let key_str = v.get("key")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "eenv.config.json missing non-empty \"key\""))?
+        .trim()
+        .to_string();
+    if key_str.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "empty key"));
+    }
+    // Derive a stable 32-byte key from the user string (works with your current 44-char key)
+    let hash = blake3::hash(key_str.as_bytes());
+    Ok(*hash.as_bytes()) // [u8;32]
+}
+
+fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp~");
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    fs::rename(tmp, path)
 }
 
 // Timing helpers
