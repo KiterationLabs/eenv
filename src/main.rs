@@ -103,6 +103,7 @@ marker = HOOK_MARKER, exe = exe_str);
     }
 
     let _ps1_changed = maybe_write(&ps1_path, &ps1_content, force)?;
+    let _ = ensure_gitignore_ignores_hooks(repo_root);
     Ok(())
 }
 
@@ -128,6 +129,68 @@ fn uninstall_git_hook(repo_root: &Path, force: bool) -> io::Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn ensure_gitignore_ignores_hooks(repo_root: &Path) -> io::Result<()> {
+    let hooks_dir = git_hooks_dir(repo_root)?; // respects core.hooksPath
+    // If hooks dir is not inside the repo worktree, nothing to do.
+    let rel = match hooks_dir.strip_prefix(repo_root) {
+        Ok(r) => r,
+        Err(_) => return Ok(()),
+    };
+
+    // If it's under .git/, it's already untracked.
+    if rel.components().next().map(|c| c.as_os_str()) == Some(std::ffi::OsStr::new(".git")) {
+        return Ok(());
+    }
+
+    // Build the specific files we manage.
+    let pre_commit = rel.join("pre-commit");
+    let pre_commit_ps1 = rel.join("pre-commit.ps1");
+
+    // Read existing .gitignore (or start empty)
+    let path = repo_root.join(".gitignore");
+    let original = if path.exists() { fs::read_to_string(&path)? } else { String::new() };
+    let mut lines: Vec<String> = if original.is_empty() { Vec::new() } else { original.lines().map(|s| s.to_string()).collect() };
+
+    // Helper to check presence by core (strip comments, trim)
+    fn core(s: &str) -> &str {
+        let mut c = s;
+        if let Some(i) = s.find('#') { c = &s[..i]; }
+        c.trim()
+    }
+    let existing: std::collections::HashSet<String> = lines.iter().map(|l| core(l).to_string()).collect();
+
+    let to_add = [
+        pre_commit.to_string_lossy().replace('\\', "/"),
+        pre_commit_ps1.to_string_lossy().replace('\\', "/"),
+    ]
+    .into_iter()
+    .filter(|p| !existing.contains(p))
+    .collect::<Vec<_>>();
+
+    if to_add.is_empty() {
+        return Ok(());
+    }
+
+    if !lines.is_empty() && !lines.last().unwrap().trim().is_empty() {
+        lines.push(String::new());
+    }
+    lines.push("# added by eenv (ignore generated git hooks)".to_string());
+    lines.extend(to_add.into_iter());
+
+    // Write atomically
+    let mut s = lines.join("\n");
+    if !s.ends_with('\n') { s.push('\n'); }
+    let tmp = path.with_extension("tmp~");
+    {
+        let mut f = File::create(&tmp)?;
+        use std::io::Write;
+        f.write_all(s.as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(tmp, &path)?;
     Ok(())
 }
 
@@ -312,6 +375,7 @@ fn init(repo_root: &Path) -> io::Result<()> {
         }
     }
 
+    let _ = ensure_gitignore_ignores_hooks(repo_root);
     Ok(())
 }
 
