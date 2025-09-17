@@ -5,9 +5,7 @@ dist
 /target
 
 # added by eenv
-eenv.config.json
-
-# added by eenv
 .env
 .env.development
 .env.production
+eenv.config.json
