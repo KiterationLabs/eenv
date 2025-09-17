@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use ignore::{DirEntry, WalkBuilder};
-use rand::{Rng, distr::Alphanumeric};
-use serde_json::{Value, json};
+use rand::{distr::Alphanumeric, Rng};
+use serde_json::{json, Value};
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
