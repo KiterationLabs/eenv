@@ -7,6 +7,7 @@ repository = "https://github.com/KiterationLabs/eenv"
 homepage = "https://github.com/KiterationLabs/eenv"
 documentation = "README.md"
 readme = "README.md"
+License = "LICENSE"
 keywords = ["git", "hook", "env", "security", "crypto"]
 categories = ["command-line-utilities", "cryptography", "development-tools"]
 exclude = [".githooks/*", ".env*", "eenv.config.json"]
