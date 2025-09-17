@@ -87,10 +87,11 @@ fn init(repo_root: &Path) -> io::Result<()> {
     // 1) Probe state (pure)
     let state = compute_eenv_state(repo_root)?;
     println!("[state]");
-    println!("enc = {}", state.enc);
-    println!("example = {}", state.example);
-    println!("env = {}", state.env);
+    println!("enc      = {}", state.enc);
+    println!("example  = {}", state.example);
+    println!("env      = {}", state.env);
     println!("eenvjson = {}", state.eenvjson);
+    println!("-----------------");
 
     // 2) If encrypted envs exist, require valid eenv.config.json before proceeding
     if state.enc {
