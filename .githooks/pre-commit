@@ -1,11 +1,4 @@
 #!/usr/bin/env bash
+# managed-by-eenv
 set -euo pipefail
-
-# ensure we run at repo root
-cd "$(git rev-parse --show-toplevel)"
-
-# Run validations only (no file changes): exit non-zero aborts the commit
-# eenv PreCommit
-
-# If you want the hook to *also* refresh .example/.enc and stage them, use:
-eenv PreCommit --write
+exec "/Users/archways404/Developer/eenv/target/release/eenv" pre-commit --write
