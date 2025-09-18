@@ -1,7 +1,12 @@
+use blake3;
+use chacha20poly1305::{
+    XChaCha20Poly1305, XNonce,
+    aead::{Aead, KeyInit},
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use ignore::{DirEntry, WalkBuilder};
-use rand::{distr::Alphanumeric, Rng};
-use serde_json::{json, Value};
+use rand::{Rng, distr::Alphanumeric};
+use serde_json::{Value, json};
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
@@ -14,20 +19,17 @@ use std::{
     io,
     path::{Path, PathBuf},
 };
-use blake3;
-use chacha20poly1305::{
-    aead::{Aead, KeyInit},
-    XChaCha20Poly1305, XNonce,
-};
 
 const MAGIC: &[u8; 5] = b"EENV1"; // magic + version
 const HOOK_MARKER: &str = "# managed-by-eenv";
 
 fn git_hooks_dir(repo_root: &Path) -> io::Result<PathBuf> {
     let out = Proc::new("git")
-        .arg("-C").arg(repo_root)
+        .arg("-C")
+        .arg(repo_root)
         .arg("rev-parse")
-        .arg("--git-path").arg("hooks")
+        .arg("--git-path")
+        .arg("hooks")
         .output()?;
     if !out.status.success() {
         return Err(io::Error::new(io::ErrorKind::Other, "git rev-parse failed"));
@@ -38,7 +40,12 @@ fn git_hooks_dir(repo_root: &Path) -> io::Result<PathBuf> {
 
 fn install_git_hook(repo_root: &Path, force: bool) -> io::Result<()> {
     // ensure it's a repo
-    let status = Proc::new("git").arg("-C").arg(repo_root).arg("rev-parse").arg("--git-dir").status()?;
+    let status = Proc::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("rev-parse")
+        .arg("--git-dir")
+        .status()?;
     if !status.success() {
         return Err(io::Error::new(io::ErrorKind::NotFound, "not a git repo"));
     }
@@ -53,18 +60,25 @@ fn install_git_hook(repo_root: &Path, force: bool) -> io::Result<()> {
     let exe_str = exe.to_string_lossy();
 
     // Generate scripts with absolute path + marker
-    let sh_content = format!(r#"#!/usr/bin/env bash
+    let sh_content = format!(
+        r#"#!/usr/bin/env bash
 {marker}
 set -euo pipefail
 exec "{exe}" pre-commit --write
-"#, marker = HOOK_MARKER, exe = exe_str);
+"#,
+        marker = HOOK_MARKER,
+        exe = exe_str
+    );
 
-    let ps1_content = format!(r#"{marker}
+    let ps1_content = format!(
+        r#"{marker}
 $ErrorActionPreference = "Stop"
 & "{exe}" pre-commit --write
 exit $LASTEXITCODE
-"#, 
-marker = HOOK_MARKER, exe = exe_str);
+"#,
+        marker = HOOK_MARKER,
+        exe = exe_str
+    );
 
     // Helper that writes/updates iff (a) missing, (b) ours already, or (c) force
     fn maybe_write(path: &Path, desired: &str, force: bool) -> io::Result<bool> {
@@ -109,7 +123,9 @@ marker = HOOK_MARKER, exe = exe_str);
 
 fn backup_path(p: &Path) -> PathBuf {
     let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     p.with_extension(format!("bak.{ts}"))
 }
 
@@ -118,7 +134,9 @@ fn uninstall_git_hook(repo_root: &Path, force: bool) -> io::Result<()> {
     let hooks_dir = git_hooks_dir(repo_root)?;
     for name in ["pre-commit", "pre-commit.ps1"] {
         let p = hooks_dir.join(name);
-        if !p.exists() { continue; }
+        if !p.exists() {
+            continue;
+        }
         if force {
             let _ = fs::remove_file(&p);
             continue;
@@ -151,16 +169,27 @@ fn ensure_gitignore_ignores_hooks(repo_root: &Path) -> io::Result<()> {
 
     // Read existing .gitignore (or start empty)
     let path = repo_root.join(".gitignore");
-    let original = if path.exists() { fs::read_to_string(&path)? } else { String::new() };
-    let mut lines: Vec<String> = if original.is_empty() { Vec::new() } else { original.lines().map(|s| s.to_string()).collect() };
+    let original = if path.exists() {
+        fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let mut lines: Vec<String> = if original.is_empty() {
+        Vec::new()
+    } else {
+        original.lines().map(|s| s.to_string()).collect()
+    };
 
     // Helper to check presence by core (strip comments, trim)
     fn core(s: &str) -> &str {
         let mut c = s;
-        if let Some(i) = s.find('#') { c = &s[..i]; }
+        if let Some(i) = s.find('#') {
+            c = &s[..i];
+        }
         c.trim()
     }
-    let existing: std::collections::HashSet<String> = lines.iter().map(|l| core(l).to_string()).collect();
+    let existing: std::collections::HashSet<String> =
+        lines.iter().map(|l| core(l).to_string()).collect();
 
     let to_add = [
         pre_commit.to_string_lossy().replace('\\', "/"),
@@ -182,7 +211,9 @@ fn ensure_gitignore_ignores_hooks(repo_root: &Path) -> io::Result<()> {
 
     // Write atomically
     let mut s = lines.join("\n");
-    if !s.ends_with('\n') { s.push('\n'); }
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
     let tmp = path.with_extension("tmp~");
     {
         let mut f = File::create(&tmp)?;
@@ -195,7 +226,10 @@ fn ensure_gitignore_ignores_hooks(repo_root: &Path) -> io::Result<()> {
 }
 
 #[derive(ValueEnum, Clone, Debug)]
-enum HookAction { Install, Uninstall }
+enum HookAction {
+    Install,
+    Uninstall,
+}
 
 // Small demo
 #[derive(Parser, Debug)]
@@ -211,7 +245,6 @@ struct Cli {
     /// Number of times to greet (used by `greet`)
     #[arg(short, long, default_value_t = 1)]
     count: u8,
-    
 }
 
 #[derive(Subcommand, Debug)]
@@ -309,7 +342,7 @@ fn init(repo_root: &Path) -> io::Result<()> {
     println!("eenvjson = {}", state.eenvjson);
     println!("-----------------");
 
-   // decrypt if .enc exist (requires valid config)
+    // decrypt if .enc exist (requires valid config)
     if state.enc {
         if state.eenvjson {
             if let Err(e) = handle_enc_workflow(repo_root) {
@@ -318,7 +351,9 @@ fn init(repo_root: &Path) -> io::Result<()> {
         } else {
             // bootstrap key flow
             match bootstrap_key_and_decrypt(repo_root) {
-                Ok(()) => eprintln!("[enc] key accepted, config created, decrypted where possible."),
+                Ok(()) => {
+                    eprintln!("[enc] key accepted, config created, decrypted where possible.")
+                }
                 Err(e) => {
                     eprintln!("[enc] could not bootstrap from key: {e}");
                     return Err(e);
@@ -329,12 +364,24 @@ fn init(repo_root: &Path) -> io::Result<()> {
 
     // examples, .gitignore, and encrypt (only for real plaintext files)
     if state.env {
-        let (files, _t_find) = time_result("find_env_files_recursive", || find_env_files_recursive(repo_root))?;
-        let ((real, examples, encs), _t_split) = time_ok("split_env_files", move || split_env_files(files));
+        let (files, _t_find) = time_result("find_env_files_recursive", || {
+            find_env_files_recursive(repo_root)
+        })?;
+        let ((real, examples, encs), _t_split) =
+            time_ok("split_env_files", move || split_env_files(files));
 
-        println!("--- real env files ---");     for p in &real { println!("{}", p.display()); }
-        println!("--- example env files ---");  for p in &examples { println!("{}", p.display()); }
-        println!("--- encrypted env files ---");for p in &encs { println!("{}", p.display()); }
+        println!("--- real env files ---");
+        for p in &real {
+            println!("{}", p.display());
+        }
+        println!("--- example env files ---");
+        for p in &examples {
+            println!("{}", p.display());
+        }
+        println!("--- encrypted env files ---");
+        for p in &encs {
+            println!("{}", p.display());
+        }
 
         if !state.example && !real.is_empty() {
             let skeletons = extract_env_skeletons(&real)?;
@@ -345,7 +392,12 @@ fn init(repo_root: &Path) -> io::Result<()> {
                         ExampleAction::Overwritten => "overwritten",
                         ExampleAction::SourceIsExample => "skip",
                     };
-                    println!("[env-example] {:<11} {}  ->  {}", label, src.display(), dst.display());
+                    println!(
+                        "[env-example] {:<11} {}  ->  {}",
+                        label,
+                        src.display(),
+                        dst.display()
+                    );
                 }
             }
         }
@@ -353,7 +405,12 @@ fn init(repo_root: &Path) -> io::Result<()> {
         match fix_gitignore_from_found(repo_root, &real) {
             Ok(report) => {
                 if report.changed {
-                    println!("[gitignore] updated: {}\n  + added:   {:?}\n  - removed: {:?}", report.path.display(), report.added, report.removed);
+                    println!(
+                        "[gitignore] updated: {}\n  + added:   {:?}\n  - removed: {:?}",
+                        report.path.display(),
+                        report.added,
+                        report.removed
+                    );
                 } else {
                     println!("[gitignore] no changes needed ({})", report.path.display());
                 }
@@ -363,8 +420,13 @@ fn init(repo_root: &Path) -> io::Result<()> {
 
         match ensure_eenv_config(repo_root) {
             Ok(ConfigStatus::Created) => eprintln!("[config] created eenv.config.json"),
-            Ok(ConfigStatus::FixedMissingKey) => eprintln!("[config] injected key into eenv.config.json"),
-            Ok(ConfigStatus::RewrittenFromInvalid { backup }) => eprintln!("[config] repaired eenv.config.json (backup: {})", backup.display()),
+            Ok(ConfigStatus::FixedMissingKey) => {
+                eprintln!("[config] injected key into eenv.config.json")
+            }
+            Ok(ConfigStatus::RewrittenFromInvalid { backup }) => eprintln!(
+                "[config] repaired eenv.config.json (backup: {})",
+                backup.display()
+            ),
             Ok(ConfigStatus::Valid) => {}
             Err(e) => eprintln!("[config] error: {e}"),
         }
@@ -396,8 +458,16 @@ fn handle_enc_workflow(repo_root: &Path) -> io::Result<()> {
         }
 
         match decrypt_file_from_enc(&aead, &enc_path, &dst) {
-            Ok(()) => println!("[enc] decrypted {} -> {}", enc_path.display(), dst.display()),
-            Err(e) => eprintln!("[enc] WARN: could not decrypt {} ({})", enc_path.display(), e),
+            Ok(()) => println!(
+                "[enc] decrypted {} -> {}",
+                enc_path.display(),
+                dst.display()
+            ),
+            Err(e) => eprintln!(
+                "[enc] WARN: could not decrypt {} ({})",
+                enc_path.display(),
+                e
+            ),
         }
     }
     Ok(())
@@ -405,7 +475,11 @@ fn handle_enc_workflow(repo_root: &Path) -> io::Result<()> {
 
 fn enc_output_path(input: &Path) -> PathBuf {
     // ".env" -> ".env.enc", ".env.local" -> ".env.local.enc"
-    let mut name = input.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+    let mut name = input
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
     name.push_str(".enc");
     input.with_file_name(name)
 }
@@ -437,10 +511,16 @@ fn encrypt_file_to_enc(aead: &XChaCha20Poly1305, src: &Path, dst: &Path) -> io::
 fn decrypt_file_from_enc(aead: &XChaCha20Poly1305, src_enc: &Path, dst: &Path) -> io::Result<()> {
     let data = fs::read(src_enc)?;
     if data.len() < MAGIC.len() + 24 + 16 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "enc file too short"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "enc file too short",
+        ));
     }
     if &data[..MAGIC.len()] != MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic/version"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad magic/version",
+        ));
     }
     let nonce_bytes = &data[MAGIC.len()..MAGIC.len() + 24];
     let nonce = XNonce::from_slice(nonce_bytes);
@@ -478,7 +558,12 @@ fn compute_eenv_state(repo_root: &Path) -> io::Result<EenvState> {
     let env = !real.is_empty();
     let eenvjson = validate_eenv_config(repo_root)?;
 
-    Ok(EenvState { enc, example, env, eenvjson })
+    Ok(EenvState {
+        enc,
+        example,
+        env,
+        eenvjson,
+    })
 }
 
 fn eenv_config_path(repo_root: &Path) -> PathBuf {
@@ -889,7 +974,9 @@ fn fix_gitignore_from_found(
     // 2) Build the required set from actually found files (relative patterns)
     let mut required: BTreeSet<String> = BTreeSet::new(); // sorted and dedup
     for abs in real_env_files {
-        let Some(fname) = abs.file_name().and_then(|s| s.to_str()) else { continue; };
+        let Some(fname) = abs.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
         if fname.ends_with(".example") || fname.ends_with(".enc") {
             continue; // <- don't ignore examples or encrypted artifacts
         }
@@ -1013,8 +1100,13 @@ fn pre_commit(repo_root: &Path, write: bool) -> io::Result<()> {
         // create/fix the config if needed
         match ensure_eenv_config(repo_root) {
             Ok(ConfigStatus::Created) => eprintln!("[config] created eenv.config.json"),
-            Ok(ConfigStatus::FixedMissingKey) => eprintln!("[config] injected key into eenv.config.json"),
-            Ok(ConfigStatus::RewrittenFromInvalid { backup }) => eprintln!("[config] repaired eenv.config.json (backup: {})", backup.display()),
+            Ok(ConfigStatus::FixedMissingKey) => {
+                eprintln!("[config] injected key into eenv.config.json")
+            }
+            Ok(ConfigStatus::RewrittenFromInvalid { backup }) => eprintln!(
+                "[config] repaired eenv.config.json (backup: {})",
+                backup.display()
+            ),
             Ok(ConfigStatus::Valid) => {}
             Err(e) => eprintln!("[config] error: {e}"),
         }
@@ -1048,8 +1140,16 @@ fn ensure_gitignore_has_config(repo_root: &Path) -> io::Result<()> {
     let root = find_repo_root(repo_root)?;
     let path = root.join(".gitignore");
 
-    let original = if path.exists() { fs::read_to_string(&path)? } else { String::new() };
-    let mut lines: Vec<String> = if original.is_empty() { Vec::new() } else { original.lines().map(|s| s.to_string()).collect() };
+    let original = if path.exists() {
+        fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let mut lines: Vec<String> = if original.is_empty() {
+        Vec::new()
+    } else {
+        original.lines().map(|s| s.to_string()).collect()
+    };
 
     let already = lines.iter().any(|l| {
         let core = pattern_core(l);
@@ -1064,7 +1164,9 @@ fn ensure_gitignore_has_config(repo_root: &Path) -> io::Result<()> {
         lines.push("eenv.config.json".to_string());
 
         let mut s = lines.join("\n");
-        if !s.ends_with('\n') { s.push('\n'); }
+        if !s.ends_with('\n') {
+            s.push('\n');
+        }
 
         let tmp = path.with_extension("tmp~");
         {
@@ -1086,7 +1188,10 @@ fn bootstrap_key_and_decrypt(repo_root: &Path) -> io::Result<()> {
     let files = find_env_files_recursive(repo_root)?;
     let (_real, _examples, encs) = split_env_files(files);
     if encs.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "no .env*.enc files found"));
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no .env*.enc files found",
+        ));
     }
 
     // 3) Validate the key by attempting to decrypt at least one file
@@ -1123,7 +1228,10 @@ fn bootstrap_key_and_decrypt(repo_root: &Path) -> io::Result<()> {
     }
 
     if !validated {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "provided key did not decrypt any .env*.enc"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provided key did not decrypt any .env*.enc",
+        ));
     }
 
     // 4) Persist config with this key & ensure .gitignore includes it
@@ -1183,7 +1291,9 @@ fn encrypt_envs_to_enc(repo_root: &Path, real_envs: &[PathBuf]) -> io::Result<Ve
 
     let mut produced = Vec::new();
     for src in real_envs {
-        let Some(name) = src.file_name().and_then(|s| s.to_str()) else { continue; };
+        let Some(name) = src.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
         // Only encrypt real envs (not examples, not already .enc)
         if name.ends_with(".example") || name.ends_with(".enc") {
             continue;
@@ -1199,11 +1309,21 @@ fn encrypt_envs_to_enc(repo_root: &Path, real_envs: &[PathBuf]) -> io::Result<Ve
 fn read_eenv_key(repo_root: &Path) -> io::Result<[u8; 32]> {
     let cfg_path = eenv_config_path(repo_root);
     let text = fs::read_to_string(&cfg_path)?;
-    let v: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad eenv.config.json: {e}")))?;
-    let key_str = v.get("key")
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("bad eenv.config.json: {e}"),
+        )
+    })?;
+    let key_str = v
+        .get("key")
         .and_then(|x| x.as_str())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "eenv.config.json missing non-empty \"key\""))?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "eenv.config.json missing non-empty \"key\"",
+            )
+        })?
         .trim()
         .to_string();
     if key_str.is_empty() {
