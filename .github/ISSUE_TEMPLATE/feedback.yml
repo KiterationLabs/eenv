@@ -1,0 +1,14 @@
+name: Feedback / Question
+description: General feedback, docs issue, or a question
+labels: ["question"]
+title: "[question] <short summary>"
+body:
+  - type: textarea
+    id: text
+    attributes:
+      label: Your message
+      description: What’s on your mind?
+      placeholder: >
+        The README was unclear about key rotation. Could you add an example?
+    validations:
+      required: true

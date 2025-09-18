@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation (README)
+    url: https://github.com/KiterationLabs/eenv#readme
+    about: Start here for install, usage, and FAQ.
+  - name: Q&A / ideas (Discussions)
+    url: https://github.com/KiterationLabs/eenv/discussions
+    about: Ask questions or brainstorm features.
+  - name: Security
+    url: https://github.com/KiterationLabs/eenv/security/policy
+    about: Report security issues privately via the security policy.
