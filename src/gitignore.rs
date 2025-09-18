@@ -85,6 +85,7 @@ pub fn fix_gitignore_from_found(
             required.insert(pat);
         }
     }
+    required.insert(".githooks".to_string());
     required.insert("eenv.config.json".to_string());
 
     let existing: HashSet<String> = lines.iter().map(|l| pattern_core(l).to_string()).collect();
