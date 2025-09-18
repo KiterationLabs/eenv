@@ -3,6 +3,7 @@ use std::io;
 
 use crate::util::find_repo_root;
 use crate::{hooks, precommit, types::HookAction};
+use crate::about;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -17,23 +18,30 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Show program copyright and a short help hint (default)
+    About,
+    /// Initialize a new project in the current directory
     #[allow(non_camel_case_types)]
     init,
+    /// Run pre-commit checks (this is run automatically by git)
     PreCommit {
         #[arg(long)]
         write: bool,
     },
+    /// Install or uninstall the git pre-commit hook
     Hook {
         #[arg(value_enum)]
         action: HookAction,
         #[arg(long, default_value_t = false)]
         force: bool,
-    },
-    Greet,
+    }
 }
 
 pub fn dispatch(cli: Cli) -> io::Result<()> {
-    match cli.command.unwrap_or(Command::Greet) {
+    match cli.command.unwrap_or(Command::About) {
+        Command::About => {
+            about::print_about();
+        }
         Command::init => {
             let cwd = std::env::current_dir()?;
             let repo_root = find_repo_root(&cwd)?;
@@ -71,11 +79,6 @@ pub fn dispatch(cli: Cli) -> io::Result<()> {
                     }
                     println!("[hook] uninstalled");
                 }
-            }
-        }
-        Command::Greet => {
-            for _ in 0..cli.count {
-                println!("Hello {}!", cli.name);
             }
         }
     }

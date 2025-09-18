@@ -6,6 +6,7 @@ mod examples;
 mod gitignore;
 mod hooks;
 mod init;
+mod about;
 mod precommit;
 mod types;
 mod util;
