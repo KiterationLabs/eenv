@@ -1,8 +1,9 @@
 [package]
 name = "eenv"
-version = "0.0.2"
+version = "0.1.1"
 edition = "2024"
 description = "Encrypted Env Manager: encrypts .env files, manages examples, and enforces safety via git hooks."
+authors = ["archways404 <archways@gmx.us>"]
 repository = "https://github.com/KiterationLabs/eenv"
 homepage = "https://github.com/KiterationLabs/eenv"
 documentation = "https://docs.rs/eenv"
@@ -19,3 +20,4 @@ rand = "0.9.2"
 serde_json = "1.0.143"
 blake3 = "1"
 chacha20poly1305 = "0.10"
+colored = "3.0.0"
