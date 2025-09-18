@@ -9,23 +9,21 @@ EENV keeps secrets safe and dev-friendly:
 - **Generates** `.env*.example` skeletons automatically.
 - **Manages** a **pre-commit** hook so all of the above runs for you.
 
----
+## NOTE
+**Active Development**  
+EENV is still under active development. 
+
+I’ll do my best to minimize breaking changes, and when they are unavoidable, I’ll announce them ahead of time and specify the release where they’ll occur.  
+
+**Feedback**  
+Suggestions, issues, and ideas for improvements are very welcome! Please open an issue or discussion in the repo if you’d like to contribute.
 
 ## Install
 ```bash
-# from crates.io
 cargo install eenv
-
-# from source (local dev)
-cargo install --path .
-
-# from Git (before publishing)
-cargo install --git https://github.com/kiterationlabs/eenv --branch master
 ```
 
 > The binary is `eenv`.
-
----
 
 ## Quick Setup
 In a repo that has `.env` files:
