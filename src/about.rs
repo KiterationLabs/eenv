@@ -9,7 +9,7 @@ pub fn print_about() {
     let authors = env!("CARGO_PKG_AUTHORS");
     let homepage = option_env!("CARGO_PKG_HOMEPAGE").unwrap_or("");
     let repo = option_env!("CARGO_PKG_REPOSITORY").unwrap_or("");
-    let license = "GPL-3.0-or-later";
+    let license = "GPL-3.0";
 
     println!("{}", "=".repeat(BANNER_WIDTH).bright_black());
     println!(

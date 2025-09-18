@@ -1,6 +1,6 @@
 [package]
 name = "eenv"
-version = "0.0.2"
+version = "0.1.0"
 edition = "2024"
 description = "Encrypted Env Manager: encrypts .env files, manages examples, and enforces safety via git hooks."
 authors = ["archways404 <archways@gmx.us>"]
